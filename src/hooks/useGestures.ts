@@ -1,5 +1,5 @@
-import { useCallback, useRef, useEffect, useState } from 'react';
-import { Hands, Results, NormalizedLandmarkList } from '@mediapipe/hands';
+import { useCallback, useRef, useEffect, useState, useMemo } from 'react';
+import { Hands, Results, NormalizedLandmarkList, NormalizedLandmark } from '@mediapipe/hands';
 
 type GestureCallback = (result: {
   gesture: string;
@@ -23,13 +23,33 @@ export const useGestures = (videoRef: React.RefObject<HTMLVideoElement>): UseGes
   // Refs for MediaPipe
   const handsRef = useRef<Hands | null>(null);
   const animationFrameRef = useRef<number>();
-  const lastGestureRef = useRef<{ gesture: string; timestamp: number }>({ 
-    gesture: '', 
-    timestamp: 0 
+  const lastGestureRef = useRef<{ gesture: string; timestamp: number }>({
+    gesture: '',
+    timestamp: 0,
   });
   const callbacksRef = useRef<GestureCallback[]>([]);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const canvasCtxRef = useRef<CanvasRenderingContext2D | null>(null);
+
+  // Motion tracking state
+  const motionStateRef = useRef<{
+    prevLandmarks: NormalizedLandmark[] | null;
+    prevTimestamp: number | null;
+    velocities: { x: number; y: number }[][];
+    directions: ('left' | 'right' | 'up' | 'down' | 'none')[];
+    motionHistory: {
+      timestamp: number;
+      landmarks: NormalizedLandmark[];
+    }[];
+  }>({
+    prevLandmarks: null,
+    prevTimestamp: null,
+    velocities: [],
+    directions: [],
+    motionHistory: [],
+  });
+  
+  const gestureHistoryRef = useRef<string[]>([]);
   
   // State for gesture detection results
   const [currentGesture, setCurrentGesture] = useState('');
@@ -126,40 +146,147 @@ export const useGestures = (videoRef: React.RefObject<HTMLVideoElement>): UseGes
     }
   }, [videoRef]);
 
-  // Process hand landmarks and detect gestures
+  // Normalize landmarks relative to wrist and scale
+  const normalizeLandmarks = useCallback((landmarks: NormalizedLandmark[]): NormalizedLandmark[] => {
+    if (!landmarks || landmarks.length === 0) return [];
+    
+    const wrist = landmarks[0];
+    const scale = distance2D(landmarks[5], landmarks[17]) || 1; // Distance between index and pinky MCP
+    
+    return landmarks.map(lm => ({
+      ...lm,
+      x: (lm.x - wrist.x) / scale,
+      y: (lm.y - wrist.y) / scale,
+      // z remains relative to wrist
+    }));
+  }, []);
+
+  // Calculate velocities between two sets of landmarks
+  const calculateVelocities = useCallback((
+    prevLandmarks: NormalizedLandmark[],
+    currentLandmarks: NormalizedLandmark[],
+    timeDelta: number
+  ): { x: number; y: number }[] => {
+    if (!prevLandmarks || !currentLandmarks || prevLandmarks.length !== currentLandmarks.length) {
+      return Array(21).fill({ x: 0, y: 0 });
+    }
+    
+    return currentLandmarks.map((lm, i) => ({
+      x: (lm.x - prevLandmarks[i].x) / timeDelta,
+      y: (lm.y - prevLandmarks[i].y) / timeDelta,
+    }));
+  }, []);
+
+  // Process hand landmarks and detect gestures with motion tracking
   function processHands(results: Results) {
-    if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+    if (!results.multiHandLandmarks?.[0]) {
       return;
     }
 
-    results.multiHandLandmarks.forEach((landmarks) => {
-      const gesture = recognizeGesture(landmarks);
-      const confidence = results.multiHandLandmarks?.length > 0 ? 0.9 : 0;
-      const gestureText = gestureToText(gesture);
-      const timestamp = Date.now();
+    const landmarks = [...results.multiHandLandmarks[0]]; // Create a copy
+    const now = performance.now();
+    const motionState = motionStateRef.current;
 
-      // Update state
-      setCurrentGesture(gesture);
-      setDetectedText(gestureText);
-      setConfidence(confidence);
+    // Normalize landmarks
+    const normalizedLandmarks = normalizeLandmarks(landmarks);
 
-      // Notify callbacks
-      const result = { gesture, text: gestureText, confidence, timestamp };
-      callbacksRef.current.forEach(callback => {
-        try {
-          callback(result);
-        } catch (e) {
-          console.error('Error in gesture callback:', e);
-        }
-      });
+    // Calculate velocities if we have previous data
+    if (motionState.prevLandmarks && motionState.prevTimestamp) {
+      const timeDelta = (now - motionState.prevTimestamp) / 1000; // Convert to seconds
+      const velocities = calculateVelocities(
+        motionState.prevLandmarks,
+        normalizedLandmarks,
+        timeDelta
+      );
+      
+      // Update motion state with new velocities (keep last 15 frames)
+      motionState.velocities = [...motionState.velocities.slice(-14), velocities];
+    }
+
+    // Update motion history (keep last 15 frames)
+    motionState.motionHistory = [
+      ...motionState.motionHistory.slice(-14),
+      { timestamp: now, landmarks: normalizedLandmarks }
+    ];
+
+    // Update previous state
+    motionState.prevLandmarks = normalizedLandmarks;
+    motionState.prevTimestamp = now;
+
+    // Detect gesture with motion context
+    const rawGesture = recognizeGesture(normalizedLandmarks, motionState);
+
+    // Temporal smoothing with majority vote
+    const history = gestureHistoryRef.current;
+    history.push(rawGesture);
+    const maxHistory = 15;
+    if (history.length > maxHistory) {
+      history.shift();
+    }
+
+    // Use a sliding window of 9 frames for majority voting
+    const windowSize = 9;
+    const recent = history.slice(-windowSize);
+    const counts: Record<string, number> = {};
+    
+    // Count occurrences of each gesture (ignoring UNKNOWN)
+    for (const g of recent) {
+      if (g === 'UNKNOWN') continue;
+      counts[g] = (counts[g] || 0) + 1;
+    }
+
+    // Find the most frequent gesture
+    let bestGesture = rawGesture;
+    let bestCount = 0;
+    Object.entries(counts).forEach(([g, c]) => {
+      if (c > bestCount) {
+        bestCount = c;
+        bestGesture = g;
+      }
+    });
+
+    // Require at least 3 consistent frames to change gesture
+    const stable = bestCount >= 3;
+    const previous = lastGestureRef.current.gesture || 'UNKNOWN';
+    const finalGesture = stable ? bestGesture : previous;
+
+    // Update last gesture if changed
+    if (finalGesture !== previous) {
+      lastGestureRef.current = { gesture: finalGesture, timestamp: Date.now() };
+    }
+
+    const confidence = finalGesture === 'UNKNOWN' ? 0.4 : 0.9;
+    const gestureText = gestureToText(finalGesture);
+    const timestamp = Date.now();
+
+    // Update state
+    setCurrentGesture(finalGesture);
+    setDetectedText(gestureText);
+    setConfidence(confidence);
+
+    // Notify callbacks with smoothed gesture
+    const result = { gesture: finalGesture, text: gestureText, confidence, timestamp };
+    callbacksRef.current.forEach((callback) => {
+      try {
+        callback(result);
+      } catch (e) {
+        console.error('Error in gesture callback:', e);
+      }
     });
   }
 
-  // Gesture recognition helpers
-  const recognizeGesture = (landmarks: NormalizedLandmarkList): string => {
-    // Heuristic-based recognition using relative joints within each finger.
-    // Y coordinates are normalized [0,1] with 0 at the top of the image.
-
+  // Gesture recognition with motion context
+  const recognizeGesture = (
+    landmarks: NormalizedLandmark[],
+    motionState: typeof motionStateRef.current
+  ): string => {
+    // Check motion-based gestures first (they have priority)
+    if (isWave(landmarks, motionState)) return 'WAVE';
+    if (isStop(landmarks, motionState)) return 'STOP';
+    
+    // Then check static gestures
+    if (isCallMe(landmarks)) return 'CALL_ME';
+    if (isRockSign(landmarks)) return 'ROCK_SIGN';
     if (isThumbUp(landmarks)) return 'THUMB_UP';
     if (isThumbDown(landmarks)) return 'THUMB_DOWN';
     if (isFist(landmarks)) return 'FIST';
@@ -168,29 +295,21 @@ export const useGestures = (videoRef: React.RefObject<HTMLVideoElement>): UseGes
     if (isPinch(landmarks)) return 'PINCH';
     if (isPeaceSign(landmarks)) return 'PEACE_SIGN';
     if (isVictoryAlt(landmarks)) return 'VICTORY_ALT';
-    if (isRockSign(landmarks)) return 'ROCK_SIGN';
-    if (isCallMe(landmarks)) return 'CALL_ME';
     if (isClaw(landmarks)) return 'CLAW';
     if (isPointUp(landmarks)) return 'POINT_UP';
     if (isPointRight(landmarks)) return 'POINT_RIGHT';
     if (isPointLeft(landmarks)) return 'POINT_LEFT';
     if (isPointDown(landmarks)) return 'POINT_DOWN';
-    if (isWave(landmarks)) return 'WAVE';
     if (isPalmUp(landmarks)) return 'PALM_UP';
     if (isPalmDown(landmarks)) return 'PALM_DOWN';
-    if (isStop(landmarks)) return 'STOP';
     if (isThreeFingers(landmarks)) return 'THREE_FINGERS';
     if (isFourFingers(landmarks)) return 'FOUR_FINGERS';
     if (isFingerHeart(landmarks)) return 'FINGER_HEART';
     if (isCrossFingers(landmarks)) return 'CROSS_FINGERS';
-
-    // More complex multi-hand gestures like HANDSHAKE_START and PRAY are
-    // difficult to infer from a single hand; we approximate them with
-    // open-hand-like poses so that they at least map to the requested labels.
     if (isHandshakeLike(landmarks)) return 'HANDSHAKE_START';
     if (isPrayLike(landmarks)) return 'PRAY';
-
     if (isOpenHand(landmarks)) return 'OPEN_HAND';
+    
     return 'UNKNOWN';
   };
 
@@ -329,17 +448,33 @@ export const useGestures = (videoRef: React.RefObject<HTMLVideoElement>): UseGes
     return veryClose && middleCurled && ringCurled && pinkyCurled;
   };
 
-  const isRockSign = (landmarks: NormalizedLandmarkList): boolean => {
+  const isRockSign = (landmarks: NormalizedLandmark[]): boolean => {
     // Rock: index and pinky extended, middle and ring curled.
     const indexExtended = isFingerExtended(landmarks, 8, 6);
     const pinkyExtended = isFingerExtended(landmarks, 20, 18);
     const middleCurled = isFingerCurled(landmarks, 12, 10);
     const ringCurled = isFingerCurled(landmarks, 16, 14);
-
-    return indexExtended && pinkyExtended && middleCurled && ringCurled;
+    
+    // Check that thumb is also extended or slightly bent
+    const thumbExtended = isFingerExtended(landmarks, 4, 3) || 
+                         (landmarks[4].y < landmarks[3].y + 0.05);
+    
+    // Check that the extended fingers are roughly at the same height
+    const indexTip = landmarks[8];
+    const pinkyTip = landmarks[20];
+    const heightDiff = Math.abs(indexTip.y - pinkyTip.y);
+    
+    // Check that the distance between index and pinky tips is reasonable
+    const tipDistance = distance2D(indexTip, pinkyTip);
+    const handWidth = distance2D(landmarks[5], landmarks[17]); // Distance between MCP joints
+    
+    return indexExtended && pinkyExtended && 
+           middleCurled && ringCurled && thumbExtended &&
+           heightDiff < 0.15 && // Fingers at similar height
+           tipDistance > handWidth * 0.8; // Fingers spread out
   };
 
-  const isCallMe = (landmarks: NormalizedLandmarkList): boolean => {
+  const isCallMe = (landmarks: NormalizedLandmark[]): boolean => {
     // Call me: thumb and pinky extended, middle fingers curled.
     const thumbExtended = isFingerExtended(landmarks, 4, 3);
     const pinkyExtended = isFingerExtended(landmarks, 20, 18);
@@ -347,7 +482,24 @@ export const useGestures = (videoRef: React.RefObject<HTMLVideoElement>): UseGes
     const middleCurled = isFingerCurled(landmarks, 12, 10);
     const ringCurled = isFingerCurled(landmarks, 16, 14);
 
-    return thumbExtended && pinkyExtended && indexCurled && middleCurled && ringCurled;
+    // Additional check for hand rotation (palm facing sideways)
+    const wrist = landmarks[0];
+    const indexMCP = landmarks[5];
+    const pinkyMCP = landmarks[17];
+    
+    // Calculate hand rotation (should be roughly vertical)
+    const handAngle = Math.atan2(
+      pinkyMCP.y - indexMCP.y,
+      pinkyMCP.x - indexMCP.x
+    );
+    
+    // Check if hand is roughly vertical (±30 degrees)
+    const isVertical = Math.abs(handAngle) > Math.PI/3 && 
+                      Math.abs(handAngle) < 2*Math.PI/3;
+
+    return thumbExtended && pinkyExtended && 
+           indexCurled && middleCurled && ringCurled &&
+           isVertical;
   };
 
   const isClaw = (landmarks: NormalizedLandmarkList): boolean => {
@@ -419,12 +571,58 @@ export const useGestures = (videoRef: React.RefObject<HTMLVideoElement>): UseGes
     return indexTip.x < wrist.x - 0.05;
   };
 
-  const isWave = (landmarks: NormalizedLandmarkList): boolean => {
-    // Approximate wave as open hand with fingers spread (index and pinky further apart).
+  const isWave = (
+    landmarks: NormalizedLandmark[],
+    motionState: typeof motionStateRef.current
+  ): boolean => {
+    // Check for open hand first
     if (!isOpenHand(landmarks)) return false;
-    const indexTip = lm(landmarks, 8);
-    const pinkyTip = lm(landmarks, 20);
-    return Math.abs(indexTip.x - pinkyTip.x) > 0.3;
+
+    // Need at least 10 frames of motion data (about 150-200ms at 60fps)
+    if (motionState.velocities.length < 10) return false;
+
+    // Analyze motion pattern for wave-like movement
+    let directionChanges = 0;
+    let lastDirection: 'left' | 'right' | 'up' | 'down' | null = null;
+    let motionAmplitude = 0;
+    let significantMotionFrames = 0;
+
+    // Look at the wrist (index 0) motion
+    for (let i = 1; i < motionState.velocities.length; i++) {
+      const vel = motionState.velocities[i]?.[0]; // Wrist velocity
+      if (!vel) continue;
+      
+      const speed = Math.sqrt(vel.x * vel.x + vel.y * vel.y);
+      
+      // Only consider significant motion (filter out small jitters)
+      if (speed < 0.1) continue;
+      significantMotionFrames++;
+
+      // Determine primary direction of motion
+      const isHorizontal = Math.abs(vel.x) > Math.abs(vel.y) * 1.5;
+      const direction = isHorizontal 
+        ? (vel.x > 0 ? 'right' : 'left')
+        : (vel.y > 0 ? 'down' : 'up');
+
+      // Track direction changes (only for horizontal motion)
+      if (isHorizontal) {
+        motionAmplitude += Math.abs(vel.x);
+        if (lastDirection && lastDirection !== direction) {
+          directionChanges++;
+        }
+        lastDirection = direction;
+      }
+    }
+
+    // Require:
+    // - At least 3 direction changes
+    // - Sufficient horizontal motion
+    // - At least 5 frames with significant motion
+    const isWaving = directionChanges >= 3 && 
+                    motionAmplitude > 0.3 && 
+                    significantMotionFrames >= 5;
+
+    return isWaving;
   };
 
   const isPalmUp = (landmarks: NormalizedLandmarkList): boolean => {
@@ -452,10 +650,44 @@ export const useGestures = (videoRef: React.RefObject<HTMLVideoElement>): UseGes
     return avgZ > wrist.z;
   };
 
-  const isStop = (landmarks: NormalizedLandmarkList): boolean => {
-    // Stop: open hand, palm facing camera and roughly vertical.
+  const isStop = (
+    landmarks: NormalizedLandmark[],
+    motionState: typeof motionStateRef.current
+  ): boolean => {
+    // Check for open hand facing camera
     if (!isOpenHand(landmarks)) return false;
-    return isPalmDown(landmarks) || isPalmUp(landmarks);
+    if (!(isPalmDown(landmarks) || isPalmUp(landmarks))) return false;
+
+    // Need at least 5 frames of motion data
+    if (motionState.velocities.length < 5) return false;
+
+    // Calculate average speed of the wrist over recent frames
+    const recentFrames = motionState.velocities.slice(-10); // Last 10 frames
+    let totalSpeed = 0;
+    let movingFrames = 0;
+    let wasMoving = false;
+
+    for (const frame of recentFrames) {
+      const vel = frame?.[0]; // Wrist velocity
+      if (!vel) continue;
+      
+      const speed = Math.sqrt(vel.x * vel.x + vel.y * vel.y);
+      totalSpeed += speed;
+      
+      // Check if hand was moving at any point
+      if (speed > 0.15) {
+        wasMoving = true;
+        movingFrames++;
+      }
+    }
+
+    const avgSpeed = totalSpeed / recentFrames.length;
+    
+    // Consider it a STOP gesture if:
+    // 1. Hand was moving in the recent past
+    // 2. Current speed is very low
+    // 3. At least 3 frames showed significant motion
+    return wasMoving && avgSpeed < 0.05 && movingFrames >= 3;
   };
 
   const isThreeFingers = (landmarks: NormalizedLandmarkList): boolean => {

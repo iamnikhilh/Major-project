@@ -309,11 +309,8 @@ export const useWebRTC = (
   useEffect(() => {
     console.log('Connecting to signaling server...');
 
-    // Connect to the same origin as the frontend (Vite dev server).
-    // Vite is configured to proxy /socket.io to http://localhost:3001,
-    // so this works both for localhost and LAN access without hardcoding
-    // a specific IP address.
-    const socket = io('/', {
+    // Connect directly to the signaling server on port 3002
+    const socket = io('http://192.168.0.111:3002', {
       path: '/socket.io',
       transports: ['websocket'],
       reconnection: true,

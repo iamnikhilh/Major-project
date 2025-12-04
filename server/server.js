@@ -61,7 +61,16 @@ io.on('connection', (socket) => {
   });
 });
 
-const PORT = 3001;
-server.listen(PORT, () => {
-  console.log(`Signaling server running on port ${PORT}`);
+const PORT = 3002;
+server.on('error', (error) => {
+  if (error.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} is already in use. Please close the other application or use a different port.`);
+  } else {
+    console.error('Server error:', error);
+  }
+  process.exit(1);
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on port ${PORT}`);
 });
