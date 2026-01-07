@@ -24,6 +24,7 @@ const VideoCall: React.FC<VideoCallProps> = ({ roomId, onLeave }) => {
   } | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [isMuted, setIsMuted] = useState(false);
 
   const {
     localStream,
@@ -265,11 +266,16 @@ const VideoCall: React.FC<VideoCallProps> = ({ roomId, onLeave }) => {
           onClick={() => {
             if (localStream) {
               const audioTrack = localStream.getAudioTracks()[0];
-              if (audioTrack) audioTrack.enabled = !audioTrack.enabled;
+              if (audioTrack) {
+                audioTrack.enabled = !audioTrack.enabled;
+                setIsMuted(!audioTrack.enabled);
+              }
             }
           }}
-          className="p-2 bg-gray-700 rounded-full hover:bg-gray-600 transition-colors"
-          title="Toggle Audio"
+          className={`p-2 rounded-full transition-colors ${
+            isMuted ? 'bg-red-500 hover:bg-red-600' : 'bg-gray-700 hover:bg-gray-600'
+          }`}
+          title={isMuted ? 'Unmute' : 'Mute'}
         >
           <svg
             className="w-6 h-6"
@@ -277,12 +283,30 @@ const VideoCall: React.FC<VideoCallProps> = ({ roomId, onLeave }) => {
             stroke="currentColor"
             viewBox="0 0 24 24"
           >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={2}
-              d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
-            />
+            {isMuted ? (
+              <>
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z"
+                  clipRule="evenodd"
+                />
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M17 14l2 2m0 0l2-2m-2 2l-2-2m2 2l2 2"
+                />
+              </>
+            ) : (
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
+              />
+            )}
           </svg>
         </button>
       </div>

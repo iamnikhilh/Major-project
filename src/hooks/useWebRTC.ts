@@ -8,6 +8,8 @@ type WebRTCReturn = {
   dataChannel: RTCDataChannel | null;
   startLocalStream: () => Promise<MediaStream | null>;
   sendMessage: (message: { type: string; data: any }) => boolean;
+  toggleMicrophone: () => void;
+  isMicrophoneMuted: boolean;
   error: string | null;
 };
 
@@ -28,6 +30,7 @@ export const useWebRTC = (
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const [isConnected, setIsConnected] = useState(false);
+  const [isMicrophoneMuted, setIsMicrophoneMuted] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const socketRef = useRef<ReturnType<typeof io> | null>(null);
@@ -39,6 +42,21 @@ export const useWebRTC = (
   const isInitiatorRef = useRef(false);
   const roomReadyRef = useRef(false);
   const offerSentRef = useRef(false);
+
+  // ----- microphone control -------------------------------------------------
+  const toggleMicrophone = useCallback(() => {
+    if (!localStreamRef.current) return;
+
+    const audioTracks = localStreamRef.current.getAudioTracks();
+    if (audioTracks.length === 0) return;
+
+    const newMuteState = !isMicrophoneMuted;
+    audioTracks.forEach(track => {
+      track.enabled = newMuteState;
+    });
+    
+    setIsMicrophoneMuted(newMuteState);
+  }, [isMicrophoneMuted]);
 
   // ----- helpers ------------------------------------------------------------
 
@@ -310,13 +328,25 @@ export const useWebRTC = (
     console.log('Connecting to signaling server...');
 
     // Connect directly to the signaling server on port 3002
-    const socket = io('http://192.168.0.111:3002', {
+    const socket = io('http://192.168.0.101:3002', {
       path: '/socket.io',
       transports: ['websocket'],
-      reconnection: true,
-      reconnectionAttempts: 10,
-      reconnectionDelay: 3000,
-      timeout: 20000,
+       reconnection: true,
+  reconnectionAttempts: 5,
+  reconnectionDelay: 1000,
+  reconnectionDelayMax: 5000,
+  timeout: 5000,
+  autoConnect: true,
+  forceNew: true,
+  upgrade: false,
+  secure: false,
+  //pingTimeout: 6000,
+  //pingInterval: 25000,
+  agent: false,
+  //closeOnBeforeunload: false,
+  //wsEngine: 'ws',
+  //ackTimeout: 1000,
+  multiplex: false
     });
 
     socketRef.current = socket;
@@ -416,6 +446,8 @@ export const useWebRTC = (
     dataChannel: dataChannelRef.current,
     startLocalStream,
     sendMessage,
+    toggleMicrophone,
+    isMicrophoneMuted,
     error,
   };
 };
